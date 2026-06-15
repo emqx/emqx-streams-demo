@@ -1,0 +1,33 @@
+name: smoke
+on:
+  push:
+  pull_request:
+
+jobs:
+  emqx:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Boot EMQX stack
+        run: make up-emqx
+      - name: Let telemetry accumulate
+        run: sleep 45
+      - name: Smoke test (replay + ordering + workers)
+        run: make smoke-emqx
+      - name: Logs on failure
+        if: failure()
+        run: docker compose --profile emqx logs
+
+  nats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Boot NATS stack
+        run: make up-nats
+      - name: Let telemetry accumulate
+        run: sleep 45
+      - name: Smoke test (replay + ordering + workers)
+        run: make smoke-nats
+      - name: Logs on failure
+        if: failure()
+        run: docker compose --profile nats logs

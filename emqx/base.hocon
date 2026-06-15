@@ -1,0 +1,19 @@
+# Demo overrides. Everything else is stock EMQX Enterprise 6.2.
+# The built-in evaluation license allows 25 concurrent sessions;
+# this demo uses about 10. For larger runs set EMQX_LICENSE__KEY.
+
+# MQTT Streams is off by default; this demo is about it.
+streams {
+  enable = true
+}
+
+# Message Queues default to "auto", which does not allow creating queues
+# over the API; enable explicitly.
+mq {
+  enable = true
+}
+
+# API key used by emqx-provision (see ../api_keys, mounted read-only).
+api_key {
+  bootstrap_file = "/opt/emqx/etc/api_keys"
+}

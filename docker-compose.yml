@@ -1,0 +1,211 @@
+name: emqx-streams-demo
+
+# Two stacks, same scenario, selected by compose profile. Each fleet speaks
+# its own broker's protocol natively, no gateway in between:
+#
+#   --profile emqx   MQTT sensors -> EMQX (MQTT Streams + Message Queues)
+#   --profile nats   NATS sensors -> NATS (JetStream streams + work queue + KV)
+#
+# The two stacks are symmetric: one broker, a sensor fleet, four consumers,
+# so the comparison is about features and fit.
+
+services:
+  # --------------------------------------------------------------- emqx stack
+  emqx:
+    profiles: [emqx]
+    image: emqx/emqx-enterprise:6.2.0
+    ports:
+      - "1885:1883"
+      - "18084:18083"
+    environment:
+      EMQX_DASHBOARD__DEFAULT_USERNAME: admin
+      EMQX_DASHBOARD__DEFAULT_PASSWORD: admin
+      EMQX_AUTHORIZATION__NO_MATCH: allow
+    volumes:
+      - ./emqx/base.hocon:/opt/emqx/etc/base.hocon:ro
+      - ./emqx/api_keys:/opt/emqx/etc/api_keys:ro
+      - emqx-data:/opt/emqx/data
+    healthcheck:
+      test: ["CMD", "emqx", "ctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks: [demo]
+
+  emqx-provision:
+    profiles: [emqx]
+    image: curlimages/curl:8.13.0
+    volumes:
+      - ./emqx/provision.sh:/provision.sh:ro
+    entrypoint: ["/bin/sh", "/provision.sh"]
+    environment:
+      EMQX_API: http://emqx:18083/api/v5
+      EMQX_KEY: demo-key
+      EMQX_SECRET: demo-secret-12345678
+    depends_on:
+      emqx:
+        condition: service_healthy
+    networks: [demo]
+
+  sensors-emqx:
+    profiles: [emqx]
+    build: { context: ./emqx/app }
+    command: ["python", "sensors.py"]
+    restart: unless-stopped
+    environment:
+      MQTT_HOST: emqx
+      MQTT_PORT: "1883"
+    depends_on:
+      emqx-provision:
+        condition: service_completed_successfully
+    networks: [demo]
+
+  live-tail-emqx:
+    profiles: [emqx]
+    build: { context: ./emqx/app }
+    command: ["python", "live_tail.py"]
+    restart: unless-stopped
+    environment: { MQTT_HOST: emqx }
+    depends_on:
+      emqx-provision:
+        condition: service_completed_successfully
+    networks: [demo]
+
+  last-value-emqx:
+    profiles: [emqx]
+    build: { context: ./emqx/app }
+    command: ["python", "last_value.py"]
+    restart: unless-stopped
+    environment: { MQTT_HOST: emqx }
+    depends_on:
+      emqx-provision:
+        condition: service_completed_successfully
+    networks: [demo]
+
+  worker-emqx-1:
+    profiles: [emqx]
+    build: { context: ./emqx/app }
+    command: ["python", "worker.py"]
+    restart: unless-stopped
+    environment: { MQTT_HOST: emqx, WORKER_ID: worker-1 }
+    depends_on:
+      emqx-provision:
+        condition: service_completed_successfully
+    networks: [demo]
+
+  worker-emqx-2:
+    profiles: [emqx]
+    build: { context: ./emqx/app }
+    command: ["python", "worker.py"]
+    restart: unless-stopped
+    environment: { MQTT_HOST: emqx, WORKER_ID: worker-2 }
+    depends_on:
+      emqx-provision:
+        condition: service_completed_successfully
+    networks: [demo]
+
+  # On-demand late joiner: `make replay-emqx` (not started by `up`)
+  replay-emqx:
+    profiles: [emqx-tools]
+    build: { context: ./emqx/app }
+    command: ["python", "replay.py"]
+    environment: { MQTT_HOST: emqx }
+    networks: [demo]
+
+  # --------------------------------------------------------------- nats stack
+  nats:
+    profiles: [nats]
+    image: nats:2.12-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+    networks: [demo]
+
+  nats-provision:
+    profiles: [nats]
+    build: { context: ./nats/app }
+    command: ["python", "provision.py"]
+    environment: { NATS_URL: nats://nats:4222 }
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks: [demo]
+
+  sensors-nats:
+    profiles: [nats]
+    build: { context: ./nats/app }
+    command: ["python", "sensors.py"]
+    restart: unless-stopped
+    environment: { NATS_URL: nats://nats:4222 }
+    depends_on:
+      nats-provision:
+        condition: service_completed_successfully
+    networks: [demo]
+
+  live-tail-nats:
+    profiles: [nats]
+    build: { context: ./nats/app }
+    command: ["python", "live_tail.py"]
+    restart: unless-stopped
+    environment: { NATS_URL: nats://nats:4222 }
+    depends_on:
+      nats-provision:
+        condition: service_completed_successfully
+    networks: [demo]
+
+  last-value-nats:
+    profiles: [nats]
+    build: { context: ./nats/app }
+    command: ["python", "last_value.py"]
+    restart: unless-stopped
+    environment: { NATS_URL: nats://nats:4222 }
+    depends_on:
+      nats-provision:
+        condition: service_completed_successfully
+    networks: [demo]
+
+  worker-nats-1:
+    profiles: [nats]
+    build: { context: ./nats/app }
+    command: ["python", "worker.py"]
+    restart: unless-stopped
+    environment: { NATS_URL: nats://nats:4222, WORKER_ID: worker-1 }
+    depends_on:
+      nats-provision:
+        condition: service_completed_successfully
+    networks: [demo]
+
+  worker-nats-2:
+    profiles: [nats]
+    build: { context: ./nats/app }
+    command: ["python", "worker.py"]
+    restart: unless-stopped
+    environment: { NATS_URL: nats://nats:4222, WORKER_ID: worker-2 }
+    depends_on:
+      nats-provision:
+        condition: service_completed_successfully
+    networks: [demo]
+
+  # On-demand late joiner: `make replay-nats` (not started by `up`)
+  replay-nats:
+    profiles: [nats-tools]
+    build: { context: ./nats/app }
+    command: ["python", "replay.py"]
+    environment: { NATS_URL: nats://nats:4222 }
+    networks: [demo]
+
+networks:
+  demo:
+    driver: bridge
+
+volumes:
+  emqx-data:
+  nats-data:
