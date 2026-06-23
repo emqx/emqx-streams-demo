@@ -1,6 +1,6 @@
 """Provision the NATS side: two JetStream streams and a KV bucket.
 
-TELEMETRY  append-only history of telemetry.>  (limits retention, 7d)
+TELEMETRY  append-only history of telemetry.>  (configured retention, 7d)
 TASKS      work-queue stream on tasks.>        (messages removed on ack)
 sensor-state  KV bucket holding latest reading per sensor
 

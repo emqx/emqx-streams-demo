@@ -1,8 +1,7 @@
 """Native NATS sensor fleet.
 
-The NATS-native counterpart to scenario/sensors (the MQTT fleet). Same
-data, each fleet speaking its own broker's protocol, no gateway in
-between.
+The NATS-native counterpart to emqx/app/sensors.py. Same data, each fleet
+speaking its own broker's protocol, no gateway in between.
 
 Three sensors publish JSON telemetry once a second to
 telemetry.<line>.<sensor> (captured by the TELEMETRY stream) and write

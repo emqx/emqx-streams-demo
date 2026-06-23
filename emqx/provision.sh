@@ -23,7 +23,7 @@ post() {
   fi
 }
 
-# Append-only stream: every telemetry message, replayable, 7d retention.
+# Append-only stream: every telemetry message, replayable, configured 7d retention.
 # key_expression message.from = the publishing client id, so ordering is
 # guaranteed per sensor.
 post /message_streams/streams '{

@@ -1,18 +1,21 @@
-# Durable streams for device telemetry: EMQX MQTT Streams vs NATS JetStream
+# EMQX MQTT Streams vs NATS JetStream
 
-The same IoT scenario built twice, once on each system, with each
-fleet speaking its broker's native protocol. A small fleet of sensors
-publishes telemetry, and four consumers have different needs:
+This repo runs the same small telemetry workload on two broker stacks:
 
-| Consumer | Needs |
+- MQTT sensors -> EMQX, with MQTT Streams, a last-value stream, and EMQX
+  Message Queue.
+- NATS sensors -> NATS, with JetStream, a KV bucket, and a work-queue stream.
+
+There is no gateway between the two. Each fleet uses its broker's native
+client. The point is to show what changes when you add durable history, current
+state, and queue workers to a broker-native telemetry path.
+
+| Consumer | What it checks |
 |---|---|
-| `live-tail` | real-time readings as they happen |
-| `replay` | joins late, replays the full history in order |
-| `last-value` | current state of every sensor on a cold start |
-| `worker` x2 | each dispatched task processed by exactly one worker |
-
-Both systems do all four. The two stacks are symmetric (one broker and a
-sensor fleet each), so the comparison is about features and fit.
+| `live-tail` | real-time readings still arrive as normal pub/sub |
+| `replay` | a late consumer can read the full history in order |
+| `last-value` | a cold-started consumer can get the latest reading per sensor |
+| `worker` x2 | each task is handled by one worker |
 
 ```
 EMQX build                         NATS build
@@ -25,10 +28,41 @@ MQTT sensors                       NATS sensors
    '- $queue/tasks                   '- TASKS work queue
 ```
 
+## Scenario
+
+The workload is deliberately small:
+
+- 3 sensors, `s1` to `s3`, on `line-1`
+- 1 telemetry reading per sensor per second
+- 1 calibration task every 15 seconds
+
+Telemetry payload:
+
+```json
+{"line": "line-1", "sensor": "s1", "seq": 17, "temp_c": 21.4,
+ "ts": "2026-06-12T10:00:00+00:00"}
+```
+
+`seq` increments per sensor. Replay consumers use it to verify ordering.
+
+EMQX publishes telemetry at QoS 1 to
+`factory/line-1/<sensor>/telemetry`. NATS publishes to
+`telemetry.line-1.<sensor>` with `Nats-Msg-Id: <sensor>-<seq>`.
+
+Task payload:
+
+```json
+{"task": "calibrate", "sensor": "s2", "seq": 4,
+ "ts": "2026-06-12T10:00:00+00:00"}
+```
+
+EMQX publishes tasks to `factory/tasks`. NATS publishes tasks to
+`tasks.dispatch`.
+
 ## Run it
 
-Prerequisites: Docker with compose. Each stack runs standalone; run one or
-both (ports do not clash).
+Prerequisite: Docker with Compose. The EMQX and NATS stacks use different
+ports, so you can run one or both.
 
 ```bash
 make up-emqx        # MQTT sensors -> EMQX (streams + queue) + consumers
@@ -42,42 +76,53 @@ docker compose logs -f live-tail-emqx last-value-emqx worker-emqx-1 worker-emqx-
 docker compose logs -f live-tail-nats last-value-nats worker-nats-1 worker-nats-2
 ```
 
-### The 15-minute path
+### What you could try
 
-1. Live tail: `docker compose logs -f live-tail-emqx`. The real-time path is
-   ordinary pub/sub; streams capture on the side without changing it.
-2. Late joiner: wait a minute, then `make replay-emqx`. A consumer that was
-   not there gets the full history in per-sensor order, then keeps tailing.
-   On EMQX this is one MQTT 5.0 subscription to `$stream/telemetry` with a
-   `stream-offset: earliest` property; on NATS (`make replay-nats`) it is an
-   ordered JetStream consumer with `DeliverPolicy: all`.
-3. Current state: `docker compose logs -f last-value-emqx`. A cold-started
-   dashboard sees the latest reading of every sensor at once. EMQX serves it
-   from a last-value stream; NATS from a KV bucket.
-4. Work queue: `docker compose logs -f worker-emqx-1 worker-emqx-2`. Each
-   task lands on exactly one worker. EMQX uses a Message Queue
-   (`$queue/tasks`); NATS uses a work-queue stream with a shared durable pull
-   consumer.
-5. Durability: `make restart-broker-emqx` (or `-nats`), then replay again.
-   History survives the restart. EMQX persists to Durable Storage (RocksDB),
-   NATS to JetStream file storage.
+1. Live tail: `docker compose logs -f live-tail-emqx`
 
-`make help` lists everything.
+   The live path is still ordinary pub/sub. Streams capture the same traffic
+   without changing the producer.
 
-## How each one builds it
+2. Replay: wait a minute, then run `make replay-emqx`
+
+   The replay consumer starts from the beginning, verifies per-sensor order,
+   and then keeps tailing live traffic. The NATS equivalent is
+   `make replay-nats`.
+
+3. Current state: `docker compose logs -f last-value-emqx`
+
+   A cold-started dashboard gets one current reading per sensor. EMQX serves
+   this from a last-value stream; NATS serves it from the `sensor-state` KV
+   bucket.
+
+4. Work queue: `docker compose logs -f worker-emqx-1 worker-emqx-2`
+
+   Each task is delivered to one worker. EMQX uses `$queue/tasks`; NATS uses a
+   shared durable pull consumer on the `TASKS` stream.
+
+5. Broker restart: `make restart-broker-emqx`, then replay again
+
+   History survives the restart. Use `make restart-broker-nats` for the NATS
+   side.
+
+`make help` lists the other commands.
+
+## Mapping
 
 | Concern | EMQX | NATS |
 |---|---|---|
-| History / replay | append-only stream `telemetry` | `TELEMETRY` stream |
-| Current state | last-value stream `state` (derived from the same topic) | KV bucket `sensor-state` (the producer writes it) |
-| Work queue | Message Queue `tasks`, read via `$queue/tasks` | work-queue stream `TASKS`, shared durable pull consumer |
-| Order unit | key expression (here the client id) | subject per sensor |
-| Produce | MQTT publish, any version, no client change | NATS publish, `Nats-Msg-Id` for dedup |
-| Consume a stream | MQTT 5.0 subscription with an offset property | NATS client |
+| History / replay | stream `telemetry` from `factory/+/+/telemetry` | stream `TELEMETRY` from `telemetry.<line>.<sensor>` |
+| Current state | last-value stream `state`, derived from the telemetry topic | KV bucket `sensor-state`, written by the producer |
+| Work queue | Message Queue `tasks` from `factory/tasks`, read via `$queue/tasks` | stream `TASKS` from `tasks.dispatch`, shared durable pull consumer |
+| Order unit | stream key expression, here the MQTT client id | subject per sensor |
+| Retention | configured as 7 days | configured as 7 days (`max_age`) |
+| Produce | ordinary MQTT publish, any MQTT version | NATS publish with `Nats-Msg-Id` for deduplication |
+| Consume stream history | MQTT 5.0 subscribe with a stream offset property | NATS JetStream consumer |
 
-## Consuming a stream, side by side
+## Replay code
 
-Replaying the telemetry stream from the beginning takes about the same amount of code either way. Trimmed from the repo (`emqx/app/replay.py` and `nats/app/replay.py`; imports and arg-parsing removed):
+Full code lives in `emqx/app/replay.py` and `nats/app/replay.py`. These
+snippets remove imports and argument parsing.
 
 EMQX, MQTT 5.0:
 
@@ -106,10 +151,8 @@ async for msg in sub.messages:
     print(json.loads(msg.data))
 ```
 
-Each gets the full history first, then keeps tailing live. The work queue is
-the one place the shapes differ: on EMQX you subscribe and the broker
-load-balances; on NATS you fetch and acknowledge in a loop, which is also what
-gives you the explicit at-least-once redelivery.
+Both consumers read history first and then keep tailing. The queue workers look
+different because the NATS version fetches and acknowledges messages explicitly.
 
 EMQX, Message Queue:
 
@@ -129,85 +172,32 @@ while True:
         await msg.ack()
 ```
 
-## What actually differs
+## Differences
 
-On the core job the two are close. Each replays history in order,
-load-balances a work queue, and serves the latest value per sensor (MQTT
-retained messages and last-value streams on one side, a KV bucket or a
-last-per-subject stream on the other). Where they diverge:
+| Area | Difference |
+|---|---|
+| Consumer position | JetStream stores named durable consumer offsets on the server. EMQX stream consumers choose a start offset and track exact resume state themselves if needed. |
+| Exactly once | MQTT QoS 2 is per-hop delivery. JetStream deduplication is producer-id based, with normal consumer ack handling. |
+| Device behavior | MQTT has last will, retained messages, and persistent client sessions as protocol features. NATS can model similar outcomes, but not as device-client protocol semantics. |
+| Endpoint protocol | MQTT favors existing device fleets and fixed firmware. NATS fits best when you control the endpoints and can use a NATS client. |
+| Portability | MQTT has many broker and client implementations. JetStream is tied to `nats-server`; both streaming features are implementation-specific. |
+| Licensing | NATS is Apache-2.0. EMQX 5.9+ is BSL 1.1; the Enterprise image includes a single-node Community License, with a Commercial License needed for full commercial or clustered use. |
 
-- Durable consumers. JetStream keeps a named consumer's position on the
-  server, so a crashed consumer reattaches and resumes exactly where it
-  stopped. An EMQX stream consumer picks a start point and tracks its own
-  position to resume. For a long-lived pipeline that must never miss or
-  reprocess, JetStream's model is less to get right.
-- Exactly-once, two meanings. MQTT QoS 2 is a transport guarantee: the broker
-  runs a handshake so a message crosses each hop exactly once, both inbound
-  from the producer and outbound to a consumer, with no application code. It
-  does not collapse logical duplicates (two publishes of the same reading).
-  JetStream is the mirror image: no per-hop handshake, but a producer stamps a
-  `Nats-Msg-Id` and the server drops a repeat within a window, and a consumer
-  double-acks so a lost ack does not cause reprocessing. MQTT gives exactly-
-  once transmission for free; JetStream gives exactly-once processing when the
-  producer sets ids and the consumer cooperates.
-- The device features around the stream. This demo does not exercise them, but
-  they are a main reason to keep a fleet on MQTT. A last-will message lets the
-  broker announce a device that drops off, so the system learns it is gone
-  without its own timeout logic. A retained message gives a dashboard or a
-  replacement unit the current state the instant it subscribes. A per-client
-  session is a durable mailbox per device, so commands sent while it was
-  offline arrive on reconnect. EMQX has all three as an MQTT broker; native
-  NATS has none as protocol features (presence from connection events, state
-  from a KV bucket, per-device durability from a consumer model not built
-  around a client identity). NATS does match MQTT on the basics (wildcards,
-  load-balanced subscriptions, headers, per-message TTL since 2.11) and its
-  request-reply is more first-class; the gap is these device features.
-- The protocol the endpoints speak. This is usually what decides it, and the
-  demo does not show it, because each fleet uses its native client. The
-  device and OT installed base is overwhelmingly MQTT, much of it third-party
-  or fixed-firmware hardware whose protocol you cannot change. If your
-  endpoints are or must be MQTT, EMQX puts durable streams natively where the
-  devices already are, alongside the rest of the MQTT and OT stack (rule
-  engine, Neuron). When you do control the endpoints and they can run a NATS
-  client, that ecosystem advantage falls away and it becomes a feature call,
-  where NATS's breadth is a real draw.
-- Open standard versus single implementation. MQTT is an OASIS and
-  ISO/IEC 20922 standard with many interoperable brokers and clients, so you
-  can change brokers without re-touching the fleet. The NATS protocol has one
-  reference implementation (CNCF nats-server, Apache-2.0); you have the
-  source, but there is no alternative server to move to. In fairness the
-  streaming feature is proprietary on both sides (MQTT Streams to EMQX,
-  JetStream to NATS); the portability is at the device layer, not the stream.
-- Licensing and footprint. NATS is Apache-2.0 and a single ~20 MB Go binary.
-  EMQX is a heavier broker on the Erlang runtime, free for single-node and
-  non-commercial use (this demo uses the built-in license, 25 sessions), with
-  a license required for clustering or commercial production.
+## Which one to start with
 
-Beyond streaming, each is also a broader platform: NATS adds a key-value store, an
-object store, and request-reply; EMQX adds a SQL rule engine and data bridges
-to Kafka and databases. A native MQTT KV store is on the EMQX 7.0 roadmap
-(~Sept 2026); an object store is not announced.
+Start with EMQX MQTT Streams when the telemetry path is MQTT. You keep device
+ingest, replayable history, latest-value state, offline-session behavior, and
+broker-side task dispatch in the same MQTT system, without adding a bridge or
+changing device clients.
 
-Producing into an EMQX stream works from any MQTT client unchanged; consuming
-a stream requires MQTT 5.0 (the offset rides on a v5 subscription property).
-Ordering is per key on both sides as configured here (per sensor), and the
-replay consumers verify it with `--verify-order`.
-
-## Choosing
-
-Choose NATS JetStream when your endpoints speak NATS or you build them to, or
-when you want an Apache-2.0 system that is also a key-value, object, and
-request-reply platform.
-
-Choose EMQX MQTT Streams when your fleet is MQTT, as most IoT and OT fleets
-are or must be, and you want durable streams together with the rest of the
-MQTT and OT stack in one system.
+Start with NATS JetStream when you control the endpoints, can use NATS clients
+directly, and want JetStream durable consumers plus NATS KV, object storage, and
+request-reply in the same system.
 
 ## Layout
 
 ```
 docker-compose.yml        both stacks, compose profiles: emqx | nats
-SCENARIO.md               the shared scenario both stacks implement
 emqx/base.hocon           streams + message queues enabled, api key bootstrap
 emqx/provision.sh         REST: telemetry stream, state stream, task queue
 emqx/app/                 MQTT fleet + consumers (paho): sensors, live_tail, replay, last_value, worker
@@ -218,5 +208,5 @@ nats/app/{live_tail,replay,last_value,worker}.py   native NATS consumers
 
 ## License
 
-Apache-2.0. EMQX Enterprise and NATS are products of their respective
-owners; this repository only orchestrates official container images.
+Apache-2.0. EMQX Enterprise and NATS are products of their respective owners;
+this repository only orchestrates official container images.
